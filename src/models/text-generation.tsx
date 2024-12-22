@@ -2,6 +2,8 @@ import "text-encoding-polyfill";
 import { Tensor } from "onnxruntime-react-native";
 import { Base } from "./base";
 
+const batchSize = 32;
+
 /**
  * Class to handle a large language model on top of onnxruntime
  */
@@ -9,20 +11,13 @@ export class TextGeneration extends Base {
   public outputTokens: bigint[] = [];
   private needPositionIds = true;
   private stopGeneration = false;
+  private attentionMaskTensor: Tensor | null = null;
 
   public initializeFeed() {
     super.initializeFeed();
     this.outputTokens = [];
   }
 
-  /**
-   * Generate tokens using greedy search
-   *
-   * @param tokens Initial tokens
-   * @param callback Callback function to handle the generated tokens
-   * @param options Generation options
-   * @returns Array of generated tokens
-   */
   public async generate(
     tokens: bigint[],
     callback: (tokens: bigint[]) => void,
@@ -30,7 +25,18 @@ export class TextGeneration extends Base {
   ): Promise<bigint[]> {
     const maxTokens = options.maxTokens;
     const feed = this.feed;
-    const initialTokens = BigInt64Array.from(tokens.map(BigInt));
+
+    // Pre-allocate reusable tensors
+    const singleTokenTensor = new Tensor("int64", [0], [1, 1]); // Initialize with safe value
+    const attentionMaskBuffer = new BigInt64Array(maxTokens);
+    attentionMaskBuffer.fill(1n);
+
+    // Safely convert tokens to BigInt64Array
+    const initialTokens = new BigInt64Array(tokens.length);
+    tokens.forEach((token, i) => {
+      initialTokens[i] = BigInt(Number(token)); // Ensure safe conversion
+    });
+
     const inputIdsTensor = new Tensor("int64", initialTokens, [
       1,
       tokens.length,
@@ -38,65 +44,129 @@ export class TextGeneration extends Base {
     feed.input_ids = inputIdsTensor;
 
     this.stopGeneration = false;
-    this.outputTokens.push(...inputIdsTensor.data);
+    this.outputTokens = [...tokens]; // Safe copy
 
     let lastToken = 0n;
     let sequenceLength = this.outputTokens.length;
     const initialLength = feed.input_ids.size;
 
-    // Prepare position IDs if needed
+    // Pre-allocate position IDs tensor if needed
+    let positionIdsTensor: Tensor | null = null;
     if (this.needPositionIds) {
-      feed.position_ids = new Tensor(
-        "int64",
-        BigInt64Array.from({ length: initialLength }, (_, i) =>
-          BigInt(sequenceLength - initialLength + i),
-        ),
-        [1, initialLength],
-      );
+      const positionIds = new BigInt64Array(initialLength);
+      for (let i = 0; i < initialLength; i++) {
+        positionIds[i] = BigInt(sequenceLength - initialLength + i);
+      }
+      positionIdsTensor = new Tensor("int64", positionIds, [1, initialLength]);
+      feed.position_ids = positionIdsTensor;
     }
 
     if (!this.sess) {
       throw new Error("Session is undefined");
     }
 
-    // Generate tokens until the end of sequence token is found or max tokens limit is reached
-    while (
-      lastToken !== this.eos &&
-      lastToken !== 32007n &&
-      sequenceLength < maxTokens &&
-      !this.stopGeneration
-    ) {
-      sequenceLength = this.outputTokens.length;
+    try {
+      while (
+        lastToken !== this.eos &&
+        lastToken !== 32007n &&
+        sequenceLength < maxTokens &&
+        !this.stopGeneration
+      ) {
+        sequenceLength = this.outputTokens.length;
 
-      feed.attention_mask = new Tensor(
-        "int64",
-        BigInt64Array.from({ length: sequenceLength }, () => 1n),
-        [1, sequenceLength],
-      );
+        // Create attention mask using BigInt64Array
+        const attentionMask = new BigInt64Array(sequenceLength);
+        attentionMask.fill(1n);
+        const newAttentionMask = new Tensor("int64", attentionMask, [
+          1,
+          sequenceLength,
+        ]);
 
-      const outputs = await this.sess.run(feed);
-      lastToken = BigInt(this.argmax(outputs.logits!));
-      this.outputTokens.push(lastToken);
+        if (this.attentionMaskTensor) {
+          this.attentionMaskTensor.dispose();
+        }
+
+        this.attentionMaskTensor = newAttentionMask;
+        feed.attention_mask = this.attentionMaskTensor;
+
+        const outputs = await this.sess.run(feed, {
+          extra: {
+            memory: {
+              enable_memory_arena_shrinkage: "cpu:0",
+              arena_extend_strategy: "kNextPowerOfTwo",
+            },
+          },
+        });
+
+        // Safely handle logits output
+        const logitsOutput = outputs.logits;
+        if (!logitsOutput) {
+          throw new Error("No logits in model output");
+        }
+
+        try {
+          lastToken = BigInt(Math.floor(this.argmax(logitsOutput)));
+          this.outputTokens.push(lastToken);
+        } catch (e) {
+          console.error("Token conversion error:", e);
+          break;
+        }
+
+        if (callback && this.outputTokens.length % batchSize === 0) {
+          callback(this.outputTokens);
+        }
+
+        this.updateKVCache(feed, outputs);
+
+        // Safe token tensor update
+        const newTokenData = new BigInt64Array([lastToken]);
+        const newSingleToken = new Tensor("int64", newTokenData, [1, 1]);
+        singleTokenTensor.dispose();
+        feed.input_ids = newSingleToken;
+
+        if (this.needPositionIds) {
+          const newPosData = new BigInt64Array([BigInt(sequenceLength)]);
+          const newPositionIds = new Tensor("int64", newPosData, [1, 1]);
+
+          if (positionIdsTensor) {
+            positionIdsTensor.dispose();
+          }
+
+          positionIdsTensor = newPositionIds;
+          feed.position_ids = positionIdsTensor;
+        }
+      }
 
       if (callback) {
-        callback(this.outputTokens);
+        callback(this.outputTokens); // Final callback with safe copy
       }
 
-      this.updateKVCache(feed, outputs);
-      feed.input_ids = new Tensor(
-        "int64",
-        BigInt64Array.from([lastToken]),
-        [1, 1],
-      );
-
-      if (this.needPositionIds) {
-        feed.position_ids = new Tensor(
-          "int64",
-          BigInt64Array.from([BigInt(sequenceLength)]),
-          [1, 1],
-        );
-      }
+      return this.outputTokens;
+    } finally {
+      inputIdsTensor.dispose();
+      this.attentionMaskTensor?.dispose();
+      positionIdsTensor?.dispose();
     }
-    return this.outputTokens;
+  }
+
+  /**
+   * Cleanup resources
+   */
+  public dispose(): void {
+    this.outputTokens = [];
+
+    if (this.attentionMaskTensor) {
+      this.attentionMaskTensor.dispose();
+      this.attentionMaskTensor = null;
+    }
+
+    this.release();
+  }
+
+  /**
+   * Stop the generation process
+   */
+  public stop(): void {
+    this.stopGeneration = true;
   }
 }

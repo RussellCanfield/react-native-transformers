@@ -1,6 +1,10 @@
-import { env, AutoTokenizer, PreTrainedTokenizer } from "@xenova/transformers";
+import {
+  env,
+  AutoTokenizer,
+  type PreTrainedTokenizer,
+} from "@xenova/transformers";
 import { TextEmbedding as Model } from "../models/text-embedding";
-import { LoadOptions } from "../models/base";
+import type { LoadOptions } from "../models/base";
 
 /** Initialization Options for Text Embedding */
 export interface TextEmbeddingOptions extends LoadOptions {

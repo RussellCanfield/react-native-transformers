@@ -1,6 +1,10 @@
-import { env, AutoTokenizer, PreTrainedTokenizer } from "@xenova/transformers";
+import {
+  env,
+  AutoTokenizer,
+  type PreTrainedTokenizer,
+} from "@xenova/transformers";
 import { TextGeneration as Model } from "../models/text-generation";
-import { LoadOptions } from "../models/base";
+import type { LoadOptions } from "../models/base";
 
 /** Initialization Options */
 export interface InitOptions extends LoadOptions {
@@ -11,6 +15,7 @@ export interface InitOptions extends LoadOptions {
 // Set up environment for transformers.js tokenizer
 env.allowRemoteModels = true;
 env.allowLocalModels = false;
+env.remotePathTemplate = "{model}";
 
 // Declare tokenizer and model
 let tokenizer: PreTrainedTokenizer;
